@@ -1,0 +1,30 @@
+#!/bin/bash
+# claude-math: Start the Math Viewer alongside Claude Code
+#
+# Usage:
+#   claude-math     (start viewer, then use claude normally)
+#
+# Reads Claude Code's JSONL transcripts directly.
+# No piping, no tee, no script command needed.
+
+PORT="${CLAUDE_MATH_PORT:-3456}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+URL="http://localhost:$PORT"
+
+# Start server if not already running
+if ! curl -s "$URL" > /dev/null 2>&1; then
+  python3 "$SCRIPT_DIR/server.py" &
+  sleep 0.5
+fi
+
+# Open browser: prefer cmux pane, fallback to system browser
+if command -v cmux &> /dev/null; then
+  cmux new-pane --type browser --direction right 2>/dev/null
+  sleep 0.2
+  cmux browser open "$URL" 2>/dev/null
+elif command -v open &> /dev/null; then
+  open "$URL" 2>/dev/null
+fi
+
+echo "● Claude Math Viewer running at $URL"
+echo "  Just run 'claude' normally — no piping needed."
