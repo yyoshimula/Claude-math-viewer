@@ -121,10 +121,10 @@ claude
 サーバーが起動しているかは、別ターミナルで以下を実行して確認できます。
 
 ```bash
-curl http://localhost:3456/api/sessions
+lsof -nP -iTCP:3456 -sTCP:LISTEN
 ```
 
-JSON が返ればサーバーは動作中です。ポートを変更している場合は `3456` をその値に置き換えてください。
+`python3` などのプロセスが表示されれば、サーバーは `3456` 番ポートで待ち受け中です。ポートを変更している場合は `3456` をその値に置き換えてください。
 
 終了方法:
 
@@ -133,11 +133,10 @@ JSON が返ればサーバーは動作中です。ポートを変更している
 Ctrl+C
 
 # バックグラウンドで起動した場合
-jobs
-kill %1
+kill $(lsof -tiTCP:3456 -sTCP:LISTEN)
 ```
 
-`jobs` に複数出る場合は、対象のジョブ番号を指定して `kill %2` のように停止します。
+ポートを変更している場合は `3456` をその値に置き換えてください。
 
 ### English
 
@@ -178,10 +177,10 @@ claude
 You can verify that the server is running from another terminal:
 
 ```bash
-curl http://localhost:3456/api/sessions
+lsof -nP -iTCP:3456 -sTCP:LISTEN
 ```
 
-If you get JSON back, the server is running. If you changed the port, replace `3456` with that value.
+If you see a process such as `python3`, the server is listening on port `3456`. If you changed the port, replace `3456` with that value.
 
 How to stop:
 
@@ -190,11 +189,10 @@ How to stop:
 Ctrl+C
 
 # If started in the background
-jobs
-kill %1
+kill $(lsof -tiTCP:3456 -sTCP:LISTEN)
 ```
 
-If `jobs` shows multiple entries, stop the correct one with its job number, such as `kill %2`.
+If you changed the port, replace `3456` with that value.
 
 ---
 
