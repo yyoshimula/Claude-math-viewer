@@ -252,6 +252,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
     margin: 1.2em 0;
   }
 
+  .message-body .table-wrap {
+    overflow-x: auto;
+    margin: 0.9em 0;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .message-body table {
+    border-collapse: collapse;
+    font-size: 0.95em;
+    width: 100%;
+  }
+  .message-body thead {
+    background: var(--bg-code);
+  }
+  .message-body th,
+  .message-body td {
+    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    padding: 8px 14px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .message-body th:last-child,
+  .message-body td:last-child {
+    border-right: none;
+  }
+  .message-body tbody tr:last-child td {
+    border-bottom: none;
+  }
+  .message-body th {
+    color: var(--text-bright);
+    font-weight: 600;
+    font-size: 0.86em;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .message-body tbody tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .message-body tbody tr:hover {
+    background: rgba(129, 140, 248, 0.06);
+  }
+
   /* KaTeX */
   .katex-display {
     margin: 1em 0;
@@ -369,6 +412,46 @@ function basicMarkdown(text) {
     return '%%IC_' + (inlineCodes.length - 1) + '%%';
   });
 
+  // GFM tables
+  const tableBlocks = [];
+  const formatCell = (s) => s
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>');
+  text = text.replace(
+    /^(\|[^\n]+\|)[ \t]*\n(\|[ \t:\-|]*-[ \t:\-|]*\|)[ \t]*\n((?:\|[^\n]+\|[ \t]*\n?)+)/gm,
+    (_, header, sep, body) => {
+      const parseCells = (line) =>
+        line.replace(/^\|/, '').replace(/\|[ \t]*$/, '').split('|').map(c => c.trim());
+      const hdr = parseCells(header);
+      const aligns = parseCells(sep).map(s => {
+        if (/^:-+:$/.test(s)) return 'center';
+        if (/^-+:$/.test(s)) return 'right';
+        if (/^:-+$/.test(s)) return 'left';
+        return '';
+      });
+      const rows = body.replace(/\n$/, '').split('\n').map(parseCells);
+
+      let html = '<div class="table-wrap"><table><thead><tr>';
+      hdr.forEach((h, i) => {
+        const a = aligns[i] ? ' style="text-align:' + aligns[i] + '"' : '';
+        html += '<th' + a + '>' + formatCell(h) + '</th>';
+      });
+      html += '</tr></thead><tbody>';
+      rows.forEach(r => {
+        html += '<tr>';
+        r.forEach((c, i) => {
+          const a = aligns[i] ? ' style="text-align:' + aligns[i] + '"' : '';
+          html += '<td' + a + '>' + formatCell(c) + '</td>';
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table></div>';
+
+      tableBlocks.push(html);
+      return '%%TB_' + (tableBlocks.length - 1) + '%%';
+    }
+  );
+
   text = text.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
   text = text.replace(/^### (.+)$/gm, '<h3>$1</h3>');
   text = text.replace(/^## (.+)$/gm, '<h2>$1</h2>');
@@ -382,6 +465,7 @@ function basicMarkdown(text) {
   text = text.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
   text = text.replace(/^(?!<[hupob]|<li|<hr|%%)(.*\S.*)$/gm, '<p>$1</p>');
 
+  text = text.replace(/%%TB_(\d+)%%/g, (_, i) => tableBlocks[i]);
   text = text.replace(/%%CB_(\d+)%%/g, (_, i) => codeBlocks[i]);
   text = text.replace(/%%IC_(\d+)%%/g, (_, i) => inlineCodes[i]);
   text = text.replace(/%%MATH_(\d+)%%/g, (_, i) => mathBlocks[i]);
