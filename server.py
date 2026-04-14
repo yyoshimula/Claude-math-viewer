@@ -131,8 +131,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     gap: 6px;
     margin-bottom: 20px;
     overflow-x: auto;
-    padding-bottom: 4px;
+    padding: 8px 0;
     scrollbar-width: none;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(6px);
   }
   .session-bar::-webkit-scrollbar { display: none; }
 
