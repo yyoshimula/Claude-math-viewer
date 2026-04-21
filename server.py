@@ -385,24 +385,19 @@ function escapeHtml(s) {
 }
 
 function basicMarkdown(text) {
-  // Pre-process: collapse multiline $$...$$ into single line so KaTeX can find them
-  text = text.replace(/\$\$\s*\n([\s\S]*?)\n\s*\$\$/g, (_, inner) => {
-    return '$$' + inner.replace(/\n/g, ' ').trim() + '$$';
-  });
-
-  // Also handle \[...\] multiline
-  text = text.replace(/\\\[\s*\n([\s\S]*?)\n\s*\\\]/g, (_, inner) => {
-    return '\\[' + inner.replace(/\n/g, ' ').trim() + '\\]';
-  });
-
-  // Protect display math blocks from markdown processing
+  // Protect display math from markdown processing, and at the same time collapse any
+  // embedded newlines to spaces so KaTeX auto-render can find them as a single block.
+  // Doing the collapse here (not as a separate pre-pass) avoids the classic pitfall
+  // where a naive `/\$\$[\s\S]*?\$\$/` pre-pass pairs the *closing* `$$` of one block
+  // with the *opening* `$$` of the next, swallowing the plain text (headings, ---,
+  // tables) that sits between them.
   const mathBlocks = [];
-  text = text.replace(/\$\$([^$]+)\$\$/g, (m) => {
-    mathBlocks.push(m);
+  text = text.replace(/\$\$([^$]+)\$\$/g, (_, inner) => {
+    mathBlocks.push('$$' + inner.replace(/\n/g, ' ').trim() + '$$');
     return '%%MATH_' + (mathBlocks.length - 1) + '%%';
   });
-  text = text.replace(/\\\[[\s\S]*?\\\]/g, (m) => {
-    mathBlocks.push(m);
+  text = text.replace(/\\\[([\s\S]*?)\\\]/g, (_, inner) => {
+    mathBlocks.push('\\[' + inner.replace(/\n/g, ' ').trim() + '\\]');
     return '%%MATH_' + (mathBlocks.length - 1) + '%%';
   });
 
