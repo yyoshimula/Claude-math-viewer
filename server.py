@@ -12,15 +12,67 @@ Usage:
   3. Just use Claude Code normally in another pane.
 """
 
+import base64
+import glob
 import http.server
 import json
-import glob
 import os
+import struct
+import subprocess
+import tempfile
+import threading
 import time
 import urllib.parse
+import urllib.request
 
 PORT = int(os.environ.get("CLAUDE_MATH_PORT", 3456))
 CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
+CONFIG_DIR = os.path.expanduser("~/.config/claude-math-viewer")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_config(updates):
+    cfg = load_config()
+    cfg.update(updates)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(CONFIG_DIR, 0o700)
+    except OSError:
+        pass
+    # Atomic-ish write: write to temp in the same dir, then rename.
+    fd, tmp = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=CONFIG_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CONFIG_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def get_gemini_key():
+    """Layered resolution: env var wins, then the on-disk config file."""
+    k = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if k:
+        return k, "env"
+    cfg = load_config()
+    k = cfg.get("gemini_api_key")
+    if isinstance(k, str) and k.strip():
+        return k.strip(), "file"
+    return None, "none"
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -62,7 +114,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .container {
     max-width: 820px;
     margin: 0 auto;
-    padding: 24px 24px 40px;
+    padding: 24px 24px 96px;  /* extra bottom padding so the sticky controls bar doesn't cover content */
+  }
+
+  .controls-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(10, 10, 12, 0.92);
+    border-top: 1px solid var(--border);
+    backdrop-filter: blur(8px);
+    z-index: 100;
+  }
+  .controls-inner {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 12px 24px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
   }
 
   /* Header */
@@ -80,6 +153,47 @@ HTML_PAGE = r"""<!DOCTYPE html>
     align-items: center;
     gap: 10px;
   }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .speech-toggle {
+    padding: 5px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-dim);
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .speech-toggle:hover {
+    border-color: var(--accent-dim);
+    color: var(--text);
+  }
+  .speech-toggle.on {
+    border-color: var(--accent);
+    background: rgba(129, 140, 248, 0.12);
+    color: var(--text-bright);
+  }
+
+  .voice-select {
+    padding: 5px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-dim);
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    cursor: pointer;
+    max-width: 140px;
+  }
+  .voice-select:hover { color: var(--text); border-color: var(--accent-dim); }
 
   .logo {
     width: 8px;
@@ -351,9 +465,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="logo"></div>
       <h1>Claude Math Viewer</h1>
     </div>
-    <div class="status">
-      <div class="status-dot" id="statusDot"></div>
-      <span id="statusText">waiting</span>
+    <div class="header-right">
+      <div class="status">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">waiting</span>
+      </div>
     </div>
   </div>
 
@@ -372,6 +488,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<div class="controls-bar">
+  <div class="controls-inner">
+    <select class="voice-select" id="backendSelect" title="TTSバックエンド">
+      <option value="say">macOS</option>
+      <option value="gemini">Gemini</option>
+    </select>
+    <select class="voice-select" id="voiceSelect" title="読み上げ音声"></select>
+    <button class="speech-toggle" id="apiKeyBtn" type="button" style="display:none" title="Gemini APIキーを設定">APIキー</button>
+    <button class="speech-toggle" id="speechToggle" type="button">音声 OFF</button>
+  </div>
+</div>
+
 <script>
 const POLL_MS = 500;
 const SESSION_POLL_MS = 3000;
@@ -379,6 +507,15 @@ let currentSession = null;  // null = auto (latest)
 let lastMsgCount = 0;
 let lastFileSize = 0;
 let sessions = [];
+let speechEnabled = false;
+let lastSpokenIndex = -1;  // index in messages[] of last assistant msg we've already dispatched
+let selectedBackend = localStorage.getItem('cmv.backend') || 'say';
+let voicesByBackend = {};
+try { voicesByBackend = JSON.parse(localStorage.getItem('cmv.voicesByBackend') || '{}'); } catch(e) {}
+// Back-compat: legacy single 'cmv.voice' key from earlier version.
+const legacyVoice = localStorage.getItem('cmv.voice');
+if (legacyVoice && !voicesByBackend.say) voicesByBackend.say = legacyVoice;
+let selectedVoice = voicesByBackend[selectedBackend] || (selectedBackend === 'gemini' ? 'Kore' : 'Kyoko');
 
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -498,6 +635,8 @@ function selectSession(sessionId) {
   currentSession = sessionId;
   lastMsgCount = 0;
   lastFileSize = 0;
+  lastSpokenIndex = -1;  // baseline will be re-established on first poll
+  postSpeak('');  // stop any in-flight speech from the previous session
   renderSessionTabs();
   pollMessages();
 }
@@ -556,6 +695,7 @@ async function pollMessages() {
     }
 
     if (data.messages.length !== lastMsgCount || data.file_size !== lastFileSize) {
+      const prevMsgCount = lastMsgCount;
       lastMsgCount = data.messages.length;
       lastFileSize = data.file_size;
 
@@ -575,6 +715,13 @@ async function pollMessages() {
         data.session_file || '';
 
       window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+
+      // On first load of a session, don't replay history — mark everything already spoken.
+      if (prevMsgCount === 0 && lastSpokenIndex < 0) {
+        lastSpokenIndex = data.messages.length - 1;
+      } else {
+        maybeSpeakNew(data.messages);
+      }
     }
   } catch (e) {
     setStatus('error', 'disconnected');
@@ -587,7 +734,157 @@ function setStatus(state, text) {
   document.getElementById('statusText').textContent = text;
 }
 
+function stripForSpeech(text) {
+  let t = text;
+  t = t.replace(/```[\s\S]*?```/g, ' コード省略 ');
+  t = t.replace(/`[^`]+`/g, '');
+  t = t.replace(/\$\$[\s\S]*?\$\$/g, ' 数式 ');
+  t = t.replace(/\\\[[\s\S]*?\\\]/g, ' 数式 ');
+  t = t.replace(/\$[^$\n]+\$/g, ' 数式 ');
+  t = t.replace(/\\\([\s\S]*?\\\)/g, ' 数式 ');
+  t = t.replace(/^\|.*\|\s*$/gm, '');
+  t = t.replace(/^#{1,6}\s+/gm, '');
+  t = t.replace(/^>\s+/gm, '');
+  t = t.replace(/^---+\s*$/gm, '');
+  t = t.replace(/\*\*(.+?)\*\*/g, '$1');
+  t = t.replace(/\*(.+?)\*/g, '$1');
+  t = t.replace(/__(.+?)__/g, '$1');
+  t = t.replace(/_(.+?)_/g, '$1');
+  t = t.replace(/^[-*]\s+/gm, '');
+  t = t.replace(/^\d+\.\s+/gm, '');
+  t = t.replace(/\s+/g, ' ').trim();
+  return t;
+}
+
+function postSpeak(text) {
+  fetch('/api/speak', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text, voice: selectedVoice, backend: selectedBackend }),
+  }).catch(() => {});
+}
+
+function rememberVoice() {
+  voicesByBackend[selectedBackend] = selectedVoice;
+  localStorage.setItem('cmv.voicesByBackend', JSON.stringify(voicesByBackend));
+}
+
+async function loadVoicesForBackend() {
+  const sel = document.getElementById('voiceSelect');
+  const keyBtn = document.getElementById('apiKeyBtn');
+  try {
+    const res = await fetch('/api/voices?backend=' + encodeURIComponent(selectedBackend));
+    if (!res.ok) return;
+    const data = await res.json();
+    const voices = data.voices || [];
+    if (voices.length === 0) { sel.style.display = 'none'; return; }
+    sel.style.display = '';
+    sel.innerHTML = '';
+    const stored = voicesByBackend[selectedBackend];
+    const fallback = selectedBackend === 'gemini' ? 'Kore' : 'Kyoko';
+    if (stored && voices.includes(stored)) selectedVoice = stored;
+    else selectedVoice = voices.includes(fallback) ? fallback : voices[0];
+    voices.forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = v;
+      if (v === selectedVoice) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    rememberVoice();
+
+    if (selectedBackend === 'gemini') {
+      keyBtn.style.display = '';
+      if (!data.gemini_available) {
+        setStatus('error', 'APIキー未設定');
+      } else if (data.gemini_key_source === 'env') {
+        keyBtn.title = '環境変数で設定済み (UIからの変更は反映されません)';
+      } else {
+        keyBtn.title = 'Gemini APIキーを変更';
+      }
+    } else {
+      keyBtn.style.display = 'none';
+    }
+  } catch (e) {}
+}
+
+async function promptAndSaveApiKey() {
+  const key = prompt(
+    'Gemini APIキーを入力 (https://aistudio.google.com/apikey で発行)\n\n' +
+    '保存先: ~/.config/claude-math-viewer/config.json (600)'
+  );
+  if (!key) return;
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gemini_api_key: key.trim() }),
+    });
+    if (res.ok) {
+      setStatus('live', 'APIキー保存しました');
+      loadVoicesForBackend();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setStatus('error', 'APIキー保存失敗: ' + (err.error || res.status));
+    }
+  } catch (e) {
+    setStatus('error', 'APIキー保存失敗: 通信エラー');
+  }
+}
+
+function maybeSpeakNew(messages) {
+  // Only speak the latest assistant message newer than lastSpokenIndex;
+  // skip any intermediate ones (interrupt semantics).
+  if (!speechEnabled) {
+    lastSpokenIndex = messages.length - 1;
+    return;
+  }
+  let target = -1;
+  for (let i = messages.length - 1; i > lastSpokenIndex; i--) {
+    if (messages[i].role === 'assistant') { target = i; break; }
+  }
+  lastSpokenIndex = messages.length - 1;
+  if (target >= 0) {
+    const plain = stripForSpeech(messages[target].content);
+    if (plain) postSpeak(plain);
+  }
+}
+
+function updateSpeechButton() {
+  const btn = document.getElementById('speechToggle');
+  btn.textContent = speechEnabled ? '音声 ON' : '音声 OFF';
+  btn.classList.toggle('on', speechEnabled);
+}
+
+function toggleSpeech() {
+  speechEnabled = !speechEnabled;
+  updateSpeechButton();
+  if (speechEnabled) {
+    // Baseline: don't replay existing history — only speak messages arriving from now on.
+    lastSpokenIndex = lastMsgCount - 1;
+  } else {
+    // Stop any in-flight speech.
+    postSpeak('');
+  }
+}
+
+document.getElementById('speechToggle').addEventListener('click', toggleSpeech);
+document.getElementById('voiceSelect').addEventListener('change', (e) => {
+  selectedVoice = e.target.value;
+  rememberVoice();
+  if (speechEnabled) postSpeak('');  // stop current playback; next msg uses new voice
+});
+document.getElementById('backendSelect').value = selectedBackend;
+document.getElementById('backendSelect').addEventListener('change', (e) => {
+  selectedBackend = e.target.value;
+  localStorage.setItem('cmv.backend', selectedBackend);
+  if (speechEnabled) postSpeak('');
+  loadVoicesForBackend();
+});
+document.getElementById('apiKeyBtn').addEventListener('click', promptAndSaveApiKey);
+
 // Initial load
+loadVoicesForBackend();
 pollSessions().then(() => pollMessages());
 
 // Poll messages frequently, sessions less often
@@ -731,9 +1028,309 @@ def extract_messages(filepath):
     return messages
 
 
+# Shared playback state — both `say` and `afplay` are tracked here so either
+# backend can preempt whatever is currently playing.
+_playback_state = {"proc": None}
+_playback_lock = threading.Lock()
+
+# Cache of ja_JP voices parsed once from `say -v '?'`.
+_voice_cache = {"say": None}
+
+# Gemini 2.5 Flash TTS prebuilt voices (from the public docs). No per-locale filter;
+# each voice is multilingual and the model infers Japanese from the input text.
+GEMINI_VOICES = [
+    "Kore", "Puck", "Zephyr", "Charon", "Fenrir", "Leda", "Orus", "Aoede",
+    "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+    "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
+    "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
+    "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
+]
+GEMINI_MODEL = "gemini-2.5-flash-preview-tts"
+GEMINI_SAMPLE_RATE = 24000
+
+
+def list_japanese_voices():
+    """Parse `say -v '?'` and return deduplicated ja_JP voice names."""
+    if _voice_cache["say"] is not None:
+        return _voice_cache["say"]
+    names = []
+    try:
+        out = subprocess.check_output(["say", "-v", "?"], stderr=subprocess.DEVNULL,
+                                       timeout=5).decode("utf-8", "replace")
+        seen = set()
+        for line in out.splitlines():
+            if "ja_JP" not in line:
+                continue
+            paren = line.find("(")
+            name = (line[:paren] if paren > 0 else line.split("  ")[0]).strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+    except Exception:
+        pass
+    _voice_cache["say"] = names
+    return names
+
+
+def voices_for_backend(backend):
+    if backend == "gemini":
+        return list(GEMINI_VOICES)
+    return list_japanese_voices()
+
+
+def _stop_current_playback_locked():
+    """Caller must hold _playback_lock."""
+    prev = _playback_state["proc"]
+    if prev is not None and prev.poll() is None:
+        try:
+            prev.terminate()
+        except Exception:
+            pass
+    _playback_state["proc"] = None
+
+
+def _start_say(text, voice):
+    voices = list_japanese_voices()
+    if voices and voice not in voices:
+        voice = "Kyoko"
+    try:
+        proc = subprocess.Popen(
+            ["say", "-v", voice],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        proc.stdin.write(text.encode("utf-8"))
+        proc.stdin.close()
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        return None
+    return proc
+
+
+def _gemini_synthesize(text, voice):
+    """Call Gemini TTS, return raw PCM bytes (24kHz 16-bit mono) or None on error."""
+    api_key, _ = get_gemini_key()
+    if not api_key:
+        print("[tts] Gemini API key not set (env or ~/.config/claude-math-viewer/config.json)")
+        return None
+    if voice not in GEMINI_VOICES:
+        voice = "Kore"
+    # Gemini TTS treats the text as a prompt, not raw speech content. Wrap with an
+    # explicit "read aloud" instruction or it will try to reply and return HTTP 400
+    # ("Model tried to generate text, but it should only be used for TTS").
+    tts_prompt = f"次の文章をそのまま自然な声で読み上げてください:\n\n{text}"
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{GEMINI_MODEL}:generateContent")
+    body = json.dumps({
+        "contents": [{"parts": [{"text": tts_prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice},
+                },
+            },
+        },
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            err_body = ""
+        print(f"[tts] gemini HTTP {e.code}: {err_body}")
+        return None
+    except Exception as e:
+        print(f"[tts] gemini request failed: {e}")
+        return None
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        for p in parts:
+            inline = p.get("inlineData") or p.get("inline_data")
+            if inline and inline.get("data"):
+                return base64.b64decode(inline["data"])
+    except (KeyError, IndexError, TypeError):
+        pass
+    print(f"[tts] gemini: no audio in response: {str(data)[:300]}")
+    return None
+
+
+def _write_wav(pcm_bytes, sample_rate=GEMINI_SAMPLE_RATE):
+    """Wrap raw 16-bit mono PCM in a WAV container; return the temp file path."""
+    fd, path = tempfile.mkstemp(prefix="cmv-tts-", suffix=".wav")
+    try:
+        num_channels = 1
+        bits_per_sample = 16
+        byte_rate = sample_rate * num_channels * bits_per_sample // 8
+        block_align = num_channels * bits_per_sample // 8
+        data_size = len(pcm_bytes)
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF", 36 + data_size, b"WAVE",
+            b"fmt ", 16, 1, num_channels, sample_rate, byte_rate,
+            block_align, bits_per_sample,
+            b"data", data_size,
+        )
+        with os.fdopen(fd, "wb") as f:
+            f.write(header)
+            f.write(pcm_bytes)
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        raise
+    return path
+
+
+def _start_afplay(wav_path):
+    try:
+        return subprocess.Popen(
+            ["afplay", wav_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def speak(text, backend="say", voice="Kyoko"):
+    """Dispatch to the selected backend. Empty text just stops current playback."""
+    if not text:
+        with _playback_lock:
+            _stop_current_playback_locked()
+        return
+
+    if backend == "gemini":
+        # Synthesize *before* taking the lock so concurrent /api/messages polls aren't
+        # blocked. The synthesis call is the slow part (~1-2s round-trip).
+        pcm = _gemini_synthesize(text, voice)
+        if not pcm:
+            return
+        try:
+            wav_path = _write_wav(pcm)
+        except Exception as e:
+            print(f"[tts] wav write failed: {e}")
+            return
+        with _playback_lock:
+            _stop_current_playback_locked()
+            proc = _start_afplay(wav_path)
+            if proc is not None:
+                _playback_state["proc"] = proc
+        return
+
+    # default: macOS `say`
+    with _playback_lock:
+        _stop_current_playback_locked()
+        proc = _start_say(text, voice)
+        if proc is not None:
+            _playback_state["proc"] = proc
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def _allowed_origin(self):
+        """CSRF guard: if an Origin header is present, require it to be our own
+        localhost origin. Non-browser clients (curl, scripts) omit Origin entirely
+        and are allowed through."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        allowed = (f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}")
+        return origin in allowed
+
+    def do_POST(self):
+        if not self._allowed_origin():
+            self.send_response(403)
+            self.end_headers()
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/config":
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            key = ""
+            if length > 0:
+                try:
+                    body = self.rfile.read(length)
+                    data = json.loads(body)
+                    if isinstance(data, dict):
+                        k = data.get("gemini_api_key", "")
+                        if isinstance(k, str):
+                            key = k.strip()
+                except Exception:
+                    pass
+            if not key:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b'{"error":"missing gemini_api_key"}')
+                return
+            try:
+                save_config({"gemini_api_key": key})
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps(
+                    {"error": f"save failed: {e}"}).encode())
+                return
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if parsed.path == "/api/speak":
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            text = ""
+            voice = "Kyoko"
+            backend = "say"
+            if length > 0:
+                try:
+                    body = self.rfile.read(length)
+                    data = json.loads(body)
+                    if isinstance(data, dict):
+                        t = data.get("text", "")
+                        if isinstance(t, str):
+                            text = t
+                        v = data.get("voice", "")
+                        if isinstance(v, str) and v:
+                            voice = v
+                        b = data.get("backend", "")
+                        if isinstance(b, str) and b in ("say", "gemini"):
+                            backend = b
+                except Exception:
+                    text = ""
+            # Cap to a sane length; trailing cutoff is fine for TTS.
+            if len(text) > 4000:
+                text = text[:4000]
+            # Run in a thread so the HTTP request returns immediately; the client
+            # does not need to block on the TTS round-trip.
+            threading.Thread(target=speak, args=(text, backend, voice),
+                             daemon=True).start()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -742,8 +1339,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if parsed.path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(HTML_PAGE.encode())
+
+        elif parsed.path == "/api/voices":
+            backend = params.get("backend", ["say"])[0]
+            if backend not in ("say", "gemini"):
+                backend = "say"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            key, source = get_gemini_key()
+            self.wfile.write(json.dumps({
+                "voices": voices_for_backend(backend),
+                "backend": backend,
+                "gemini_available": bool(key),
+                "gemini_key_source": source,  # "env" | "file" | "none"
+            }, ensure_ascii=False).encode())
 
         elif parsed.path == "/api/sessions":
             self.send_response(200)
@@ -791,7 +1405,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"\033[38;5;141m●\033[0m Claude Math Viewer")
     print(f"  Server:  http://localhost:{PORT}")
     print(f"  Watch:   {CLAUDE_DIR}")

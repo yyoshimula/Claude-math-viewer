@@ -33,6 +33,13 @@ The server never talks to Claude Code directly. It reads the JSONL transcript fi
 - `GET /` — serves the embedded HTML page.
 - `GET /api/sessions` — lists the 15 most recently modified JSONL files with id / project / label (first user message preview) / mtime. Full file paths are **deliberately stripped** before JSON encoding.
 - `GET /api/messages?session=<id>` — re-parses the JSONL on every request and returns `{messages, file_size, session_file}`. No caching, no diffing server-side.
+- `GET /api/voices?backend=say|gemini` — lists voices for the selected backend. Response includes `gemini_available` (is a key resolvable?) and `gemini_key_source` (`env` | `file` | `none`). macOS voices are parsed once from `say -v '?'` (ja_JP only); Gemini voices are the 30 prebuilt voices hardcoded in `GEMINI_VOICES`.
+- `POST /api/speak` — body `{"text": "...", "backend": "say"|"gemini", "voice": "..."}`. Dispatches via `speak()` which is invoked on a daemon thread so the HTTP reply returns immediately. Both backends share `_playback_state` (guarded by `_playback_lock`) — any new request terminates the previous subprocess before starting a new one (interrupt semantics). `say` pipes text to stdin; Gemini calls the API, wraps the returned PCM (24kHz/16bit/mono) in a WAV header via `_write_wav`, and plays with `afplay` on a temp file. Empty text just stops current playback. Text is capped at 4000 chars. The client calls this on each new assistant message when the header "音声 ON" toggle is active; history is never replayed — a baseline `lastSpokenIndex` is set on first load and on session switch.
+- `POST /api/config` — body `{"gemini_api_key": "..."}`. Writes to `~/.config/claude-math-viewer/config.json` (mode 0600, dir 0700) via atomic `os.replace`. `get_gemini_key()` resolves the key in this order on every call (no restart needed): env var `GEMINI_API_KEY`/`GOOGLE_API_KEY` → config file → `None`. The UI exposes this via an "APIキー" button visible only when the Gemini backend is selected.
+
+Server uses `ThreadingHTTPServer` so long-running Gemini synthesis (~1–2s) does not stall the 500 ms `/api/messages` polling.
+
+`Handler._allowed_origin()` CSRF-guards every POST: if an `Origin` header is present it must match `http://localhost:{PORT}` or `http://127.0.0.1:{PORT}`, otherwise the request is rejected with 403. Non-browser clients (curl, scripts) that omit `Origin` entirely are allowed through.
 
 ### Client polling model
 
