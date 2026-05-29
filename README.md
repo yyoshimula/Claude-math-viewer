@@ -49,10 +49,18 @@ cd claude-math-viewer
 chmod +x claude-math
 ```
 
-エイリアス設定（任意）:
+どこからでも `claude-math` で起動できるようにするには、PATH の通ったディレクトリ
+（例: `~/.local/bin`）へシンボリックリンクを張ります。ラッパーはリンク経由でも
+本体の場所を正しく解決します。
 
 ```bash
-echo 'alias claude-math="/path/to/claude-math-viewer/claude-math"' >> ~/.zshrc
+ln -sf "$PWD/claude-math" ~/.local/bin/claude-math
+```
+
+`~/.local/bin` が PATH に無い場合は次を `~/.zshrc` に追加してください。
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -71,10 +79,18 @@ cd claude-math-viewer
 chmod +x claude-math
 ```
 
-Optional alias setup:
+To run `claude-math` from anywhere, symlink it into a directory on your PATH
+(e.g. `~/.local/bin`). The wrapper resolves its real location even when invoked
+through a symlink.
 
 ```bash
-echo 'alias claude-math="/path/to/claude-math-viewer/claude-math"' >> ~/.zshrc
+ln -sf "$PWD/claude-math" ~/.local/bin/claude-math
+```
+
+If `~/.local/bin` is not on your PATH, add it to `~/.zshrc`:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -84,15 +100,21 @@ source ~/.zshrc
 
 ### 日本語
 
-#### cmux の場合
+#### claude-math ラッパー
 
 ```bash
-# ビューアを起動（サーバー起動 + 右にブラウザペインが開く）
+# サーバーを起動して URL を表示（既に起動済みなら何もしない）
 claude-math
+# ● Claude Math Viewer running at http://localhost:3456
 
-# 同じまたは別のペインで Claude Code を普通に使う
+# 表示された URL を好きなブラウザで開き、別ペインで Claude Code を普通に使う
 claude
 ```
+
+ラッパーはブラウザを自動で開きません。表示された URL を自分で開いてください
+（システムブラウザ、cmux のブラウザペイン `open -a cmux $URL`、Cursor の Simple Browser など）。
+サーバーは完全にデタッチされて起動するため、`claude-math` を実行したターミナルを
+閉じてもサーバーは動き続けます。
 
 #### Cursor の場合
 
@@ -140,15 +162,21 @@ kill $(lsof -tiTCP:3456 -sTCP:LISTEN)
 
 ### English
 
-#### With cmux
+#### The claude-math wrapper
 
 ```bash
-# Start the viewer (launches the server and opens a browser pane on the right)
+# Start the server and print the URL (no-op if already running)
 claude-math
+# ● Claude Math Viewer running at http://localhost:3456
 
-# Use Claude Code normally in the same or another pane
+# Open the printed URL in any browser, then use Claude Code normally in another pane
 claude
 ```
+
+The wrapper does not open a browser for you — open the printed URL yourself
+(system browser, a cmux browser pane via `open -a cmux $URL`, Cursor's Simple Browser, etc.).
+The server starts fully detached, so it keeps running even after you close the
+terminal you launched `claude-math` from.
 
 #### With Cursor
 
@@ -227,7 +255,7 @@ If you changed the port, replace `3456` with that value.
 ```text
 claude-math-viewer/
 ├── server.py      — Python HTTP サーバー + HTML/KaTeX（全部入り）
-├── claude-math    — ラッパースクリプト（cmux 対応）
+├── claude-math    — ラッパースクリプト（サーバーを起動し URL を表示）
 ├── .gitignore
 └── README.md
 ```
@@ -237,7 +265,7 @@ claude-math-viewer/
 ```text
 claude-math-viewer/
 ├── server.py      — Python HTTP server + embedded HTML/KaTeX
-├── claude-math    — Wrapper script with cmux support
+├── claude-math    — Wrapper script (starts the server, prints the URL)
 ├── .gitignore
 └── README.md
 ```

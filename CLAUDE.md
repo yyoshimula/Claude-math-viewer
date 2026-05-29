@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 python3 server.py              # foreground
 python3 server.py &            # background
-./claude-math                  # wrapper: starts server (if down) + opens browser pane
+./claude-math                  # wrapper: starts server (if down), prints URL — open it yourself
 
 # Verify listener / kill background instance
 lsof -nP -iTCP:3456 -sTCP:LISTEN
